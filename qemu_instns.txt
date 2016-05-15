@@ -1,0 +1,227 @@
+================== Steps to install a VM on Qemu ========================
+0. Create a qemu hard disk
+	qemu-img create ubuntu-test 20G
+	qemu-img create video-file-dataset 10G
+
+1. To install Ubuntu server edition on VM
+	sudo qemu-system-x86_64 -hda ubuntu-server-test -cdrom ubuntu-14.04.4-server-amd64.iso -m 10240 -boot d -smp 12 -enable-kvm
+ 
+2. To start VNC, from the configuration at ~/.vnc/startup
+	vncserver 
+ 
+3. To change the VNC password
+	vncpasswd
+ 
+4. To launch the VM with no network, with 12 cores and vnc
+ 
+	sudo qemu-system-x86_64 -hda ubuntu-server-test -m 10240 -boot c -smp 12 -enable-kvm -vnc :0 -net none
+
+5. To connect to this from outside world, use Vinagre for Linux or TightVNC Viewer for Windows
+	10.22.17.141::5900
+
+6. To mount a qemu partition
+	modprobe nbd max_part=16
+	qemu-nbd -c /dev/nbd0 video-file-dataset
+	partprobe /dev/nbd0
+	mount /dev/nbd0p1 /qemu_mnt
+
+7. To unmount the qemu partition
+	umount /qemu_mnt
+	qemu-nbd -d /dev/nbd0
+	
+
+
+
+================== Steps to install Openvswitch on Ubuntu ========================
+
+ovs-vswitchd : daemon that does flow based switching. Kernel based module
+ovsdb-server : configuration database. ovs-vswitchd queries this to obtain its configuration
+ovs-vsctl    : utility to query and update the configuration of openvswitch
+
+A. Install Openvswitch
+
+1. Download the ovs source code
+
+2. Run configure. By default installs under /usr/local. To use the kernel mode switch --
+   ./configure --with-linux=/lib/modules/`uname -r`/build`
+
+3. make
+
+4. make install
+
+5. make modules_install
+
+B. Initialize the configuration database using the ovsdb-tool
+
+	mkdir -p /usr/local/etc/openvswitch 
+	ovsdb-tool create /usr/local/etc/openvswitch/conf.db vswitchd/vswitch.ovsschema
+
+C. Start openvswitchd daemon
+
+1. Load the kernel module
+	/sbin/modprobe openvswitch
+
+2. Start the configuration database server
+	ovsdb-server --remote=punix:/usr/local/var/run/openvswitch/db.sock \
+                 --remote=db:Open_vSwitch,Open_vSwitch,manager_options \
+                 --private-key=db:Open_vSwitch,SSL,private_key \
+                 --certificate=db:Open_vSwitch,SSL,certificate \
+                 --bootstrap-ca-cert=db:Open_vSwitch,SSL,ca_cert \
+                 --pidfile --detach
+
+3. Initialize the configuration database server
+	ovs-vsctl --no-wait init
+
+4. Start the switch daemon. You can attach a custom log destination with --log-file option
+	ovs-vswitchd --pidfile --detach
+
+5. Setup the bridge that the Qemu VMs will connect to
+	ovs-vsctl add-br br0
+	sudo ifconfig br0 192.168.100.1
+	sudo sysctl -w net.ipv4.ip_forward=1
+	sudo route add -net 192.168.100.0 netmask 255.255.255.0 dev br0
+
+6. Setup the bridge that the outside world will connect to
+	ovs-vsctl add-br br1
+	sudo ifconfig br1 192.168.200.1
+	sudo route add -net 192.168.200.0 netmask 255.255.255.0 dev br1
+
+D. Launch Qemu VMs with the openvswitch bridge
+
+1. Create the following if-up and if-down scripts
+-------------- /etc/ovs-ifup ----------------
+#!/bin/sh
+
+switch='br0'
+
+/sbin/ifconfig $1 0.0.0.0 up
+
+ovs-vsctl add-port ${switch} $1
+
+-------------- /etc/ovs-ifdown --------------
+
+#!/bin/sh
+
+switch='br0'
+
+/sbin/ifconfig $1 0.0.0.0 down
+
+ovs-vsctl del-port ${switch} $1
+
+For the load balancer VM we need another set of scripts
+
+-------------- /etc/ovs-ifup-lb ----------------
+#!/bin/sh
+
+switch='br1'
+
+/sbin/ifconfig $1 0.0.0.0 up
+
+ovs-vsctl add-port ${switch} $1
+
+-------------- /etc/ovs-ifdown-lb --------------
+
+#!/bin/sh
+
+switch='br1'
+
+/sbin/ifconfig $1 0.0.0.0 down
+
+ovs-vsctl del-port ${switch} $1
+
+
+	
+2. Launch Qemu with TUN/TAP interfaces (virtual interfaces) and with custom ifup and ifdown scripts that connect to the openvswitch bridge.
+sudo qemu-system-x86_64 -hda ubuntu-server-test1 -hdb video-file-dataset -m 4192 -boot c -smp 4 -enable-kvm -no-reboot -net nic,macaddr=52:54:00:12:34:57 -net tap,script=/etc/ovs-ifup,downscript=/etc/ovs-ifdown & # -vnc :2 -net user
+sudo qemu-system-x86_64 -hda ubuntu-server-test2 -hdb video-file-dataset -m 4192 -boot c -smp 4 -enable-kvm -no-reboot -net nic,macaddr=52:54:00:12:34:58 -net tap,script=/etc/ovs-ifup,downscript=/etc/ovs-ifdown & # -vnc :3 -net user
+sudo qemu-system-x86_64 -hda ubuntu-server-test3 -hdb video-file-dataset -m 4192 -boot c -smp 4 -enable-kvm -no-reboot -net nic,macaddr=52:54:00:12:34:59 -net tap,script=/etc/ovs-ifup,downscript=/etc/ovs-ifdown & # -vnc :3 -net user
+sudo qemu-system-x86_64 -hda ubuntu-server-load-balancer -m 4192 -boot c -smp 12 -enable-kvm -no-reboot -net nic,macaddr=52:54:00:12:34:60 -net tap,script=/etc/ovs-ifup,downscript=/etc/ovs-ifdown \
+	-net nic,macaddr=52:54:00:12:34:61 -net tap,script=/etc/ovs-ifup-lb,downscript=/etc/ovs-ifdown-lb & # -vnc :3 -net user
+
+
+
+Make sure that the devices have different MAC addresses, otherwise ARP will not work and bad things will happen
+3. Run the following command to verify that the tap interface is created
+	ovs-vsctl show
+
+
+
+======================= Setup ECN on the Openvswitch ===================
+
+Interesting tidbit about ECN flags from http://blog.catchpoint.com/2015/10/30/tcp-flags-cwr-ece/ --
+
+During the synchronization phase of a connection between client and server, the TCP CWR and ECE flags work in conjunction to establish whether the connection is capable of leveraging congestion notification. In order to work, both client and server need to support ECN. To accomplish this, the sender sends a SYN packet with the ECE and CWR flags set, and the receiver sends back the SYN-ACK with only the ECE flag set. Any other configuration indicates a non-ECN setup.
+So how does it work? Assuming an ECN-aware network, an oversimplification of the process looks like this: when a router detects congestion, rather than dropping packets destined to a receiver, it marks them with the CE flag in the IP header and delivers the packet to the receiver.
+Prior to acknowledging the receipt of the packet, the receiver sets the ECE flag in the TCP header of the ACK and sends it back to the sender. The sender having received the ECE marked ACK responds by halving the send window and reducing the slow start threshold.
+
+
+We use Queuing Disciplines (qdisc) to set up ECN at the switch. We add the RED qdisc with ECN to the openvswitch bridge. From the man pages,
+
+tc qdisc ... red limit bytes [ min bytes ] [ max bytes ] avpkt bytes
+       [ burst packets ] [ ecn ] [ harddrop] [ bandwidth rate ] [
+       probability chance ] [ adaptive ]
+
+limit		: The hard limit on the queue size. Further packets are dropped
+min 		: The minimum queue size following which packets are marked wiht a probability 'chance'
+max		: At this queue size the probability of marking packets is maximum
+burst		: 
+avpkt		: Used for average queue size calculations
+bandwidth	: Set this to the bandwidth of your interface. Used for internal calculations
+ecn		: Mark packets instead of dropping
+harddrop	: Harddrop packets above max limit (ignore, for our purposes)
+adaptive	: Adaptive RED (ignore, for our purposes)
+
+1. Add the RED qdisc and the traffic shaping.
+	tc qdisc add dev tap0 root handle 1:1 tbf rate 100Mbit burst 15000 latency 10us
+	tc qdisc add dev tap0 parent 1:1 handle 10:1 red limit 100000 min 30000 max 90000 avpkt 1000 burst 35 ecn bandwidth 100Mbit
+
+	tc qdisc add dev tap1 root handle 1:1 tbf rate 100Mbit burst 15000 latency 10us
+	tc qdisc add dev tap1 parent 1:1 handle 10:1 red limit 100000 min 30000 max 90000 avpkt 1000 burst 35 ecn bandwidth 100Mbit
+
+
+	tc qdisc add dev tap2 root handle 1:1 tbf rate 100Mbit burst 15000 latency 10us
+	tc qdisc add dev tap2 parent 1:1 handle 10:1 red limit 100000 min 30000 max 90000 avpkt 1000 burst 35 ecn bandwidth 100Mbit
+
+	tc qdisc add dev tap3 root handle 1:1 tbf rate 200Mbit burst 15000 latency 10us
+	tc qdisc add dev tap3 parent 1:1 handle 10:1 red limit 100000 min 30000 max 90000 avpkt 1000 burst 35 ecn bandwidth 200Mbit
+
+   Check that the qdisc got added
+	tc qdisc
+
+   To show the status of the qdisc
+	tc -s qdisc show
+
+   To remove the qdisc, run 
+	tc qdisc del dev tap0 root
+	tc qdisc del dev tap1 root
+	tc qdisc del dev tap2 root
+	tc qdisc del dev tap3 root
+
+2. Launch the VMs and set ecn enabled on the host and the VMs
+	sysctl -w net.ipv4.tcp_ecn=1 
+
+
+
+============================= Video Streaming Setup ============================
+
+0. Boot the VM with the default user mode networking. This is fast enough for our purposes. Run the dhclient on the required interface.
+	dhclient eth0
+
+1. Clone the cloudsuite benchmark repository.
+
+2. Generate the workload into /videos.
+
+3. Install nginx and start serving the videos.
+
+4. Insert the DCTCP module and change the congestion control algorithm to DCTCP
+	insmod /lib/modules/4.2.0-27-generic/kernel/net/ipv4/tcp_dctcp.ko
+	sysctl -w net.ipv4.tcp_ecn=1
+	sysctl -w net.ipv4.tcp_congestion_control=dctcp
+
+
+============================ Reasonable Queue limit =============================
+
+Cisco IOS XE Release 3S: Internetworking Operating System which supports 10Gbps links has configurable queue limit
+The packets-per-queue range is 1 to 2000000.
+
+Our network links are 1 Gbps, so our limits are 1 to 200000. (rather 100000)
